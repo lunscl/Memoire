@@ -1,0 +1,122 @@
+---
+title: "Traitements"
+author: "Luna Colovray"
+date: "2025-03-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(sf)
+library(dplyr)
+library(tidyr)
+
+DVF <- read.csv("datas/dvf20142024.csv", encoding = "UTF-8", sep =";")
+dim(DVF)
+```
+
+# Nettoyage des données
+## 1. Filtre et nettoyage des données
+```{r}
+# Sélection des mutations de type "Vente" des maisons et appartements 
+etape1 <- DVF %>% filter(Nature.de.la.mutation == "Vente")
+etape1bis <- etape1 %>% filter(Type.de.local == "Appartement")
+
+# Sélection et renommage des variables
+etape2 <- etape1bis %>% select(id = Identifiant.de.mutation..Etalab., disposition = Numéro.de.disposition, parcelle = Identifiant.de.la.parcelle.cadastrale, date = Date.de.la.mutation, nature = Nature.de.la.mutation, codecommune = Code.INSEE.de.la.commune, departement = Code.INSEE.du.département, type = Type.de.local, surface = Surface.réelle.du.bâti, piece = Nombre.de.pièces.principales, prix = Valeur.foncière, latitude = Latitude, longitude = Longitude)
+
+# Remplacement et suppression des cellules vides 
+etape2[etape2 == ""] <- NA
+etape3 <- etape2 %>% na.omit()
+```
+
+## 2. Suppression des doublons et des mutations multiventes
+
+```{r}
+table(any(duplicated(paste0(etape3$id, etape3$prix, etape3$surface)))) # pour vérifier s'il y a des doublons (lignes partageant le même id, le même prix et la même surface)
+unique <- etape3 %>% distinct(id, prix, surface)
+nbunique <- unique %>% group_by(id) %>% summarise(nb = n())
+etape4 <- nbunique %>% filter(nb == 1)
+
+merge <- cbind(etape4, etape3[match(etape4$id, etape3$id), -1, drop = TRUE])
+etape5 <- merge %>% select(id, date, type, nature, codecommune, prix, surface, piece, latitude, longitude)
+
+etape5$prix <- as.numeric(etape5$prix)
+etape5$surface <- as.numeric(etape5$surface)
+etape5$piece <- as.numeric(etape5$piece)
+```
+
+## 3. Suppression des valeurs aberrantes
+
+```{r}
+# Fixer un seuil minimal et maximal global
+quantile(etape5$prix, 0.01)
+options(scipen=999)
+summary(etape5$prix)
+hist(etape5$prix, breaks = 50000, xlim = c(0,1000000))
+
+# Créer des jeux de données et fixer des seuils maximaux de surface
+Appartements <- etape5 %>% filter (type == 'Appartement') 
+hist(Appartements$surface, nclass = 500, xlim = c(0,200))
+
+# Sélection des bornes de prix et de surface
+etape6 <- etape5 %>% filter(between(prix, 15000, 6000000)) %>%
+                     filter(case_when(type == 'Appartement' ~ between(surface, 10, 150)))
+```
+
+## 4. Calcul du prix au m² et exclusion des valeurs extrêmes et aberrantes
+
+```{r}
+etape7 <- etape6 %>% mutate(prixm2 = prix/surface)
+
+# Sélection des bornes 
+quantile(etape7$prixm2, 0.01)
+hist(etape7$prixm2, breaks = 1000, xlim = c(0,10000))
+
+etape8 <- etape7 %>% filter(between(prixm2,0,10000))
+etape8 <- etape8 %>% mutate(annee = substr(etape8$date, 1, 4))
+etape8$prix <- round(etape8$prix)
+etape8$prixm2 <- round(etape8$prixm2)
+```
+## 5. Trier les données dans le périmètre et celles hors périmètres
+
+```{r}
+# Vérifier s'il y a des valeurs manquantes dans longitude et latitude
+sum(is.na(etape8$longitude))  # Nombre de valeurs manquantes en longitude
+sum(is.na(etape8$latitude))   # Nombre de valeurs manquantes en latitude
+
+# Supprimer les lignes avec des coordonnées manquantes
+etape9 <- etape8 %>% 
+  drop_na(longitude, latitude)
+
+# Convertir en objet spatial (Système de coordonnées WGS 84 - EPSG:4326)
+etape9_sf <- st_as_sf(etape8, coords = c("longitude", "latitude"), crs = 4326)
+
+# Définir le point central
+mairie_aubervilliers <- st_sfc(st_point(c(2.3844, 48.9101)), crs = 4326)
+
+# Reprojeter en Lambert-93 (EPSG:2154) pour calculer des distances en mètres
+etape9_sf <- st_transform(etape9_sf, crs = 2154)
+mairie_aubervilliers <- st_transform(mairie_aubervilliers, crs = 2154)
+
+buffer_800m <- st_buffer(mairie_aubervilliers, dist = 800)
+etape9_sf <- etape9_sf %>%
+  mutate(in_800m = ifelse(st_within(etape9_sf, buffer_800m, sparse = FALSE), 
+                          "Dans le périmètre", "Hors du périmètre"))
+
+etape9_sf <- etape9_sf %>%
+  st_transform(crs = 4326) %>%   # Transformation en latitude/longitude
+  mutate(
+    longitude = st_coordinates(.)[, 1],  # Extraction de la coordonnée X (longitude)
+    latitude = st_coordinates(.)[, 2]    # Extraction de la coordonnée Y (latitude)
+  )
+
+# Sauvegarder le fichier final sans la géométrie
+write.csv(st_drop_geometry(etape9_sf), "DVFOK.csv", row.names = FALSE)
+```
+
+
